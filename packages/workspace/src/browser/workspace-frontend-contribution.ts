@@ -16,8 +16,9 @@
 
 import { injectable, inject } from 'inversify';
 import { CommandContribution, CommandRegistry, MenuContribution, MenuModelRegistry } from '@theia/core/lib/common';
+import { isOSX, isElectron } from '@theia/core';
 import { open, OpenerService, CommonMenus, StorageService, LabelProvider, ConfirmDialog, KeybindingRegistry, KeybindingContribution } from '@theia/core/lib/browser';
-import { FileStatNode, FileDialogService, OpenFileDialogProps } from '@theia/filesystem/lib/browser';
+import { FileDialogService, OpenFileDialogProps } from '@theia/filesystem/lib/browser';
 import { FileSystem } from '@theia/filesystem/lib/common';
 import { WorkspaceService, THEIA_EXT, VSCODE_EXT } from './workspace-service';
 import { WorkspaceCommands } from './workspace-commands';
@@ -28,20 +29,21 @@ import URI from '@theia/core/lib/common/uri';
 @injectable()
 export class WorkspaceFrontendContribution implements CommandContribution, KeybindingContribution, MenuContribution {
 
-    constructor(
-        @inject(FileSystem) protected readonly fileSystem: FileSystem,
-        @inject(OpenerService) protected readonly openerService: OpenerService,
-        @inject(WorkspaceService) protected readonly workspaceService: WorkspaceService,
-        @inject(StorageService) protected readonly workspaceStorage: StorageService,
-        @inject(LabelProvider) protected readonly labelProvider: LabelProvider,
-        @inject(QuickOpenWorkspace) protected readonly quickOpenWorkspace: QuickOpenWorkspace,
-        @inject(FileDialogService) protected readonly fileDialogService: FileDialogService,
-        @inject(WorkspacePreferences) protected preferences: WorkspacePreferences
-    ) { }
+    @inject(FileSystem) protected readonly fileSystem: FileSystem;
+    @inject(OpenerService) protected readonly openerService: OpenerService;
+    @inject(WorkspaceService) protected readonly workspaceService: WorkspaceService;
+    @inject(StorageService) protected readonly workspaceStorage: StorageService;
+    @inject(LabelProvider) protected readonly labelProvider: LabelProvider;
+    @inject(QuickOpenWorkspace) protected readonly quickOpenWorkspace: QuickOpenWorkspace;
+    @inject(FileDialogService) protected readonly fileDialogService: FileDialogService;
+    @inject(WorkspacePreferences) protected preferences: WorkspacePreferences;
 
     registerCommands(commands: CommandRegistry): void {
+        // Not visible/enabled on Windows/Linux in electron.
         commands.registerCommand(WorkspaceCommands.OPEN, {
-            isEnabled: () => true,
+            isEnabled: () => isOSX || !isElectron(),
+            isVisible: () => isOSX || !isElectron(),
+            // tslint:disable-next-line:no-any
             execute: (args: any[]) => {
                 if (args) {
                     const [fileURI] = args;
@@ -49,6 +51,18 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
                 }
                 return this.doOpen();
             }
+        });
+        // Visible/enabled only on Windows/Linux in electron.
+        commands.registerCommand(WorkspaceCommands.OPEN_FILE, {
+            isEnabled: () => !isOSX && isElectron(),
+            isVisible: () => !isOSX && isElectron(),
+            execute: () => this.doOpen({ canSelectFiles: true, canSelectFolders: false })
+        });
+        // Visible/enabled only on Windows/Linux in electron.
+        commands.registerCommand(WorkspaceCommands.OPEN_FOLDER, {
+            isEnabled: () => !isOSX && isElectron(),
+            isVisible: () => !isOSX && isElectron(),
+            execute: () => this.doOpen({ canSelectFiles: false, canSelectFolders: true })
         });
         commands.registerCommand(WorkspaceCommands.OPEN_WORKSPACE, {
             isEnabled: () => true,
@@ -69,10 +83,22 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
     }
 
     registerMenus(menus: MenuModelRegistry): void {
-        menus.registerMenuAction(CommonMenus.FILE_OPEN, {
-            commandId: WorkspaceCommands.OPEN.id,
-            order: 'a00'
-        });
+        if (isOSX || !isElectron()) {
+            menus.registerMenuAction(CommonMenus.FILE_OPEN, {
+                commandId: WorkspaceCommands.OPEN.id,
+                order: 'a00'
+            });
+        }
+        if (!isOSX && isElectron()) {
+            menus.registerMenuAction(CommonMenus.FILE_OPEN, {
+                commandId: WorkspaceCommands.OPEN_FILE.id,
+                order: 'a01'
+            });
+            menus.registerMenuAction(CommonMenus.FILE_OPEN, {
+                commandId: WorkspaceCommands.OPEN_FOLDER.id,
+                order: 'a02'
+            });
+        }
         menus.registerMenuAction(CommonMenus.FILE_OPEN, {
             commandId: WorkspaceCommands.OPEN_WORKSPACE.id,
             order: 'a10'
@@ -93,9 +119,15 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
 
     registerKeybindings(keybindings: KeybindingRegistry): void {
         keybindings.registerKeybinding({
-            command: WorkspaceCommands.OPEN.id,
+            command: isOSX || !isElectron() ? WorkspaceCommands.OPEN.id : WorkspaceCommands.OPEN_FILE.id,
             keybinding: 'ctrlcmd+alt+o',
         });
+        if (!isOSX && isElectron()) {
+            keybindings.registerKeybinding({
+                command: WorkspaceCommands.OPEN_FOLDER.id,
+                keybinding: 'ctrl+k ctrl+o',
+            });
+        }
         keybindings.registerKeybinding({
             command: WorkspaceCommands.OPEN_WORKSPACE.id,
             keybinding: 'ctrlcmd+alt+w',
@@ -106,26 +138,37 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
         });
     }
 
-    protected doOpen(): void {
+    protected doOpen(options?: Readonly<{ canSelectFolders?: boolean, canSelectFiles?: boolean }>): void {
+        let props: OpenFileDialogProps = {
+            title: WorkspaceCommands.OPEN.label!,
+            canSelectFolders: true,
+            canSelectFiles: true
+        };
+        if (options) {
+            props = {
+                ...props,
+                ...options
+            };
+        }
         this.workspaceService.roots.then(async roots => {
-            const node = await this.fileDialogService.showOpenDialog({
-                title: WorkspaceCommands.OPEN.label!,
-                canSelectFolders: true,
-                canSelectFiles: true
-            }, roots[0]);
-            this.doOpenFileOrFolder(node);
+            const uri = await this.fileDialogService.showOpenDialog(props, roots[0]);
+            this.doOpenFileOrFolder(uri);
         });
     }
 
-    protected doOpenFileOrFolder(node: Readonly<FileStatNode> | undefined): void {
-        if (!node) {
+    protected doOpenFileOrFolder(uri: URI | undefined): void {
+        if (!uri) {
             return;
         }
-        if (node.fileStat.isDirectory) {
-            this.workspaceService.open(node.uri);
-        } else {
-            open(this.openerService, node.uri);
-        }
+        this.fileSystem.getFileStat(uri.toString()).then(stat => {
+            if (stat) {
+                if (stat.isDirectory) {
+                    this.workspaceService.open(uri);
+                } else {
+                    open(this.openerService, uri);
+                }
+            }
+        });
     }
 
     protected async openWorkspace(): Promise<void> {
@@ -137,6 +180,7 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
         await this.preferences.ready;
         if (this.preferences['workspace.supportMultiRootWorkspace']) {
             option.canSelectFiles = true;
+            option.canSelectFolders = false;
             option.filters = {
                 'Theia Workspace (*.theia-workspace)': [THEIA_EXT],
                 'VS Code Workspace (*.code-workspace)': [VSCODE_EXT]
@@ -145,7 +189,7 @@ export class WorkspaceFrontendContribution implements CommandContribution, Keybi
         const selected = await this.fileDialogService.showOpenDialog(option);
         if (selected) {
             // open the selected directory, or recreate a workspace from the selected file
-            this.workspaceService.open(selected.uri);
+            this.workspaceService.open(selected);
         }
     }
 
